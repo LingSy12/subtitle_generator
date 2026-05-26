@@ -1,12 +1,12 @@
-# YouTube Chinese Subtitle Generator
+# Chinese Subtitle Generator
 
 Local command-line software for recognizing speech in long videos and generating
-YouTube-ready Chinese subtitle timing files.
+Chinese subtitle timing files.
 
 It creates:
 
-- `.srt` subtitle file, best for YouTube upload
-- `.vtt` subtitle file, also accepted by YouTube
+- `.srt` subtitle file, widely supported by players and platforms
+- `.vtt` subtitle file, used by web players
 - `.sbv`, `.ttml`, `.ass`, `.lrc`, and `.csv` timed exports
 - `.txt` plain transcript
 - optional `.jsonl` segment log for checking timings
@@ -138,21 +138,12 @@ Example direct Python command:
 python -m ytsubtitle "D:\Videos\lecture.mp4" --language zh --model medium
 ```
 
-## 4. Upload to YouTube
-
-In YouTube Studio:
-
-1. Open the video.
-2. Go to **Subtitles**.
-3. Add Chinese.
-4. Upload the generated `.srt` file with timing.
-
 ## Notes For Long Videos
 
 - `medium` is usually a good first pass on CPU.
 - `large-v3` is more accurate but much slower and larger.
 - Use `--vad` to skip silence and speed up some recordings.
-- If YouTube timings do not line up, use `--accurate-timing`. This is slower
+- If subtitle timings do not line up, use `--accurate-timing`. This is slower
   because it keeps the original audio timeline instead of relying on VAD silence
   removal.
 - `--word-timestamps` can make cue boundaries tighter, but it is heavier on GPU
