@@ -21,11 +21,6 @@ VIDEO_FILE_TYPES = [
     ("All files", "*.*"),
 ]
 
-OUTPUT_FILE_TYPES = [
-    ("SubRip subtitle", "*.srt"),
-    ("All files", "*.*"),
-]
-
 PROGRESS_PREFIX = "__YTSUBTITLE_PROGRESS__"
 OUTPUT_FORMAT_OPTIONS = [
     ("srt", "SRT"),
@@ -282,11 +277,12 @@ class SubtitleGui(tk.Tk):
         self.minsize(920, 680)
 
         self.process: subprocess.Popen[str] | None = None
-        self.log_queue: queue.Queue[tuple[str, str | int | None]] = queue.Queue()
+        self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
 
-        self.input_path = tk.StringVar()
-        self.output_file = tk.StringVar(value=str(project_root() / "subtitles" / "subtitle.srt"))
-        self.output_file_is_auto = True
+        self.queue_items: list[str] = []
+        self.queue_running = False
+        self.cancel_requested = False
+        self.output_dir = tk.StringVar(value="")
         self.model = tk.StringVar(value="medium")
         self.language = tk.StringVar(
             value=LANGUAGE_CODE_TO_DISPLAY.get("zh", "Auto-detect")
@@ -333,7 +329,7 @@ class SubtitleGui(tk.Tk):
         title.grid(row=0, column=0, sticky="w")
         subtitle = ttk.Label(
             header,
-            text="Pick a video or audio file, choose a language, and generate timed subtitle files.",
+            text="Add one or more files to the queue, choose options, and generate subtitles.",
         )
         subtitle.grid(row=1, column=0, sticky="w", pady=(4, 0))
 
@@ -346,24 +342,58 @@ class SubtitleGui(tk.Tk):
         body.add(controls, weight=0)
 
         row = 0
-        ttk.Label(controls, text="Video/audio").grid(row=row, column=0, sticky="w")
-        ttk.Entry(controls, textvariable=self.input_path).grid(
-            row=row, column=1, columnspan=3, sticky="ew", padx=(10, 8)
+        ttk.Label(controls, text="Files").grid(row=row, column=0, sticky="nw")
+
+        queue_frame = ttk.Frame(controls)
+        queue_frame.grid(row=row, column=1, columnspan=3, sticky="nsew", padx=(10, 8))
+        queue_frame.columnconfigure(0, weight=1)
+        queue_frame.rowconfigure(0, weight=1)
+
+        self.queue_tree = ttk.Treeview(
+            queue_frame,
+            columns=("file", "status"),
+            show="headings",
+            height=5,
+            selectmode="extended",
         )
-        ttk.Button(controls, text="Browse", command=self._browse_input).grid(
-            row=row, column=4, sticky="ew"
+        self.queue_tree.heading("file", text="File")
+        self.queue_tree.heading("status", text="Status")
+        self.queue_tree.column("file", width=460, anchor="w")
+        self.queue_tree.column("status", width=110, anchor="w")
+        self.queue_tree.grid(row=0, column=0, sticky="nsew")
+        queue_scroll = ttk.Scrollbar(
+            queue_frame, orient="vertical", command=self.queue_tree.yview
         )
+        queue_scroll.grid(row=0, column=1, sticky="ns")
+        self.queue_tree.configure(yscrollcommand=queue_scroll.set)
+
+        queue_buttons = ttk.Frame(controls)
+        queue_buttons.grid(row=row, column=4, sticky="nsew")
+        self.add_files_button = ttk.Button(
+            queue_buttons, text="Add Files", command=self._add_files
+        )
+        self.add_files_button.grid(row=0, column=0, sticky="ew")
+        self.remove_button = ttk.Button(
+            queue_buttons, text="Remove", command=self._remove_selected
+        )
+        self.remove_button.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.clear_queue_button = ttk.Button(
+            queue_buttons, text="Clear", command=self._clear_queue
+        )
+        self.clear_queue_button.grid(row=2, column=0, sticky="ew", pady=(4, 0))
 
         row += 1
-        ttk.Label(controls, text="Output base file").grid(
+        ttk.Label(controls, text="Output folder").grid(
             row=row, column=0, sticky="w", pady=(10, 0)
         )
-        ttk.Entry(controls, textvariable=self.output_file).grid(
+        self.output_dir_entry = ttk.Entry(controls, textvariable=self.output_dir)
+        self.output_dir_entry.grid(
             row=row, column=1, columnspan=3, sticky="ew", padx=(10, 8), pady=(10, 0)
         )
-        ttk.Button(controls, text="Save As", command=self._browse_output).grid(
-            row=row, column=4, sticky="ew", pady=(10, 0)
+        self.output_dir_browse_button = ttk.Button(
+            controls, text="Browse", command=self._browse_output_dir
         )
+        self.output_dir_browse_button.grid(row=row, column=4, sticky="ew", pady=(10, 0))
 
         row += 1
         self._add_combo_row(
@@ -456,7 +486,7 @@ class SubtitleGui(tk.Tk):
         actions.grid(row=row, column=0, columnspan=5, sticky="ew", pady=(14, 0))
         actions.columnconfigure(4, weight=1)
 
-        self.start_button = ttk.Button(actions, text="Generate Subtitles", command=self._start)
+        self.start_button = ttk.Button(actions, text="Start Queue", command=self._start)
         self.start_button.grid(row=0, column=0, sticky="w")
         self.cancel_button = ttk.Button(
             actions, text="Cancel", command=self._cancel, state=tk.DISABLED
@@ -522,111 +552,211 @@ class SubtitleGui(tk.Tk):
             )
             combo.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-    def _browse_input(self) -> None:
-        path = filedialog.askopenfilename(title="Choose video or audio", filetypes=VIDEO_FILE_TYPES)
-        if path:
-            self.input_path.set(path)
-            if self.output_file_is_auto:
-                self.output_file.set(str(default_output_file_for(path)))
+    def _add_files(self) -> None:
+        if self.queue_running:
+            return
+        paths = filedialog.askopenfilenames(
+            title="Choose video or audio files", filetypes=VIDEO_FILE_TYPES
+        )
+        for path in paths:
+            self.queue_items.append(path)
+        self._rebuild_queue_tree()
 
-    def _browse_output(self) -> None:
-        current = ensure_srt_suffix(self.output_file.get().strip())
-        current_path = Path(current).resolve()
-        path = filedialog.asksaveasfilename(
-            title="Choose output subtitle file",
-            defaultextension=".srt",
-            filetypes=OUTPUT_FILE_TYPES,
-            initialdir=str(current_path.parent),
-            initialfile=current_path.name,
+    def _remove_selected(self) -> None:
+        if self.queue_running:
+            return
+        selection = self.queue_tree.selection()
+        if not selection:
+            return
+        indices = sorted({int(iid) for iid in selection}, reverse=True)
+        for idx in indices:
+            if 0 <= idx < len(self.queue_items):
+                del self.queue_items[idx]
+        self._rebuild_queue_tree()
+
+    def _clear_queue(self) -> None:
+        if self.queue_running:
+            return
+        self.queue_items.clear()
+        self.queue_tree.delete(*self.queue_tree.get_children())
+
+    def _browse_output_dir(self) -> None:
+        if self.queue_running:
+            return
+        current = self.output_dir.get().strip()
+        if current and Path(current).exists():
+            initial = current
+        elif self.queue_items:
+            initial = str(Path(self.queue_items[0]).parent)
+        else:
+            initial = str(project_root())
+        path = filedialog.askdirectory(
+            title="Choose output folder (leave empty for per-file default)",
+            initialdir=initial,
+            mustexist=False,
         )
         if path:
-            self.output_file.set(str(ensure_srt_suffix(path)))
-            self.output_file_is_auto = False
+            self.output_dir.set(path)
+
+    def _rebuild_queue_tree(self) -> None:
+        self.queue_tree.delete(*self.queue_tree.get_children())
+        for index, path in enumerate(self.queue_items):
+            self.queue_tree.insert(
+                "", "end", iid=str(index), values=(Path(path).name, "Pending")
+            )
+
+    def _set_item_status(self, index: int, status: str) -> None:
+        iid = str(index)
+        if not self.queue_tree.exists(iid):
+            return
+        if 0 <= index < len(self.queue_items):
+            name = Path(self.queue_items[index]).name
+            self.queue_tree.item(iid, values=(name, status))
 
     def _start(self) -> None:
-        input_path = self.input_path.get().strip()
-        output_file = ensure_srt_suffix(self.output_file.get().strip())
-
-        if not input_path:
-            messagebox.showerror("Missing video", "Choose a video or audio file first.")
+        if self.queue_running:
             return
-        if not Path(input_path).exists():
-            messagebox.showerror("File not found", f"Input file does not exist:\n{input_path}")
+        if not self.queue_items:
+            messagebox.showerror("Empty queue", "Add at least one file to the queue.")
             return
-        if not output_file:
-            messagebox.showerror("Missing output file", "Choose an output .srt file.")
+        missing = [p for p in self.queue_items if not Path(p).exists()]
+        if missing:
+            messagebox.showerror(
+                "File not found", "These files do not exist:\n" + "\n".join(missing)
+            )
             return
         output_formats = self._selected_output_formats()
         if not output_formats:
             messagebox.showerror("Missing output format", "Choose at least one output format.")
             return
 
-        self.output_file.set(output_file)
-        output_dir, _basename, _srt_path = split_output_target(output_file)
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        output_dir_text = self.output_dir.get().strip()
+        output_dir_override: str | None = output_dir_text or None
+        if output_dir_override:
+            try:
+                Path(output_dir_override).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                messagebox.showerror("Cannot create output folder", str(exc))
+                return
 
-        python_exe = find_python_executable()
-        command = build_transcribe_command(
-            python_exe=python_exe,
-            input_path=input_path,
-            output_file=output_file,
-            model=self.model.get(),
-            language=parse_language_value(self.language.get()),
-            script=self.script.get(),
-            device=RUN_ON_TO_DEVICE.get(self.run_on.get(), "auto"),
-            compute_type=self.compute_type.get(),
-            vad=self.vad.get(),
-            output_formats=output_formats,
-            extract_audio=self.extract_audio.get(),
-            initial_prompt=self.prompt_text.get("1.0", tk.END),
-            low_vram=self.low_vram.get(),
-            accurate_timing=self.accurate_timing.get(),
-            beam_size=parse_int_option(self.beam_size.get(), 1),
-            word_timestamps=self.word_timestamps.get(),
-            media_chunk_seconds=parse_chunk_option(self.media_chunk.get()),
-            media_chunk_overlap_seconds=3,
-            no_cpu_fallback=self.gpu_only.get()
-            and RUN_ON_TO_DEVICE.get(self.run_on.get(), "auto") != "cpu",
-            task=parse_task_value(self.task.get()),
-        )
+        for index in range(len(self.queue_items)):
+            self._set_item_status(index, "Pending")
+
+        device = RUN_ON_TO_DEVICE.get(self.run_on.get(), "auto")
+        config = {
+            "model": self.model.get(),
+            "language": parse_language_value(self.language.get()),
+            "script": self.script.get(),
+            "device": device,
+            "compute_type": self.compute_type.get(),
+            "vad": self.vad.get(),
+            "output_formats": output_formats,
+            "extract_audio": self.extract_audio.get(),
+            "initial_prompt": self.prompt_text.get("1.0", tk.END),
+            "low_vram": self.low_vram.get(),
+            "accurate_timing": self.accurate_timing.get(),
+            "beam_size": parse_int_option(self.beam_size.get(), 1),
+            "word_timestamps": self.word_timestamps.get(),
+            "media_chunk_seconds": parse_chunk_option(self.media_chunk.get()),
+            "media_chunk_overlap_seconds": 3,
+            "no_cpu_fallback": self.gpu_only.get() and device != "cpu",
+            "task": parse_task_value(self.task.get()),
+        }
 
         self._clear_log()
-        self._append_log("Command:\n" + printable_command(command) + "\n\n")
+        self.cancel_requested = False
         self._set_running(True)
 
-        thread = threading.Thread(target=self._run_process, args=(command,), daemon=True)
+        thread = threading.Thread(
+            target=self._run_queue,
+            args=(list(self.queue_items), config, output_dir_override),
+            daemon=True,
+        )
         thread.start()
 
-    def _run_process(self, command: list[str]) -> None:
-        try:
-            self.process = subprocess.Popen(
-                command,
-                cwd=str(project_root()),
-                env=child_process_env(),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
+    def _run_queue(
+        self,
+        paths: list[str],
+        config: dict,
+        output_dir_override: str | None,
+    ) -> None:
+        python_exe = find_python_executable()
+        total = len(paths)
+        for index, input_path in enumerate(paths):
+            if self.cancel_requested:
+                self.log_queue.put(("item_status", (index, "Cancelled")))
+                continue
+
+            if output_dir_override:
+                output_file = str(
+                    Path(output_dir_override) / f"{Path(input_path).stem}.srt"
+                )
+            else:
+                output_file = str(default_output_file_for(input_path))
+            output_dir, _basename, _srt_path = split_output_target(output_file)
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+            command = build_transcribe_command(
+                python_exe=python_exe,
+                input_path=input_path,
+                output_file=output_file,
+                **config,
             )
-        except OSError as exc:
-            self.log_queue.put(("line", f"Failed to start transcription: {exc}\n"))
-            self.log_queue.put(("done", 1))
-            return
 
-        assert self.process.stdout is not None
-        for line in self.process.stdout:
-            self.log_queue.put(("line", line))
+            self.log_queue.put(("item_status", (index, "Running")))
+            self.log_queue.put(("reset_progress", None))
+            self.log_queue.put(
+                ("line", f"\n=== [{index + 1}/{total}] {Path(input_path).name} ===\n")
+            )
+            self.log_queue.put(("line", "Command:\n" + printable_command(command) + "\n\n"))
 
-        return_code = self.process.wait()
-        self.log_queue.put(("done", return_code))
+            try:
+                self.process = subprocess.Popen(
+                    command,
+                    cwd=str(project_root()),
+                    env=child_process_env(),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+            except OSError as exc:
+                self.log_queue.put(("line", f"Failed to start transcription: {exc}\n"))
+                self.log_queue.put(("item_status", (index, "Error")))
+                continue
+
+            assert self.process.stdout is not None
+            for line in self.process.stdout:
+                self.log_queue.put(("line", line))
+
+            return_code = self.process.wait()
+            self.process = None
+
+            if return_code == 0:
+                status = "Done"
+            elif self.cancel_requested:
+                status = "Cancelled"
+            else:
+                status = f"Error ({return_code})"
+            self.log_queue.put(("item_status", (index, status)))
+            self.log_queue.put(
+                ("line", f"\n--- {Path(input_path).name}: {status} ---\n")
+            )
+
+        self.log_queue.put(("queue_done", None))
 
     def _cancel(self) -> None:
-        if self.process and self.process.poll() is None:
-            self._append_log("\nCancelling transcription...\n")
-            self.process.terminate()
-            self.cancel_button.configure(state=tk.DISABLED)
+        self.cancel_requested = True
+        proc = self.process
+        if proc is not None and proc.poll() is None:
+            self._append_log("\nCancelling current transcription...\n")
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        self.cancel_button.configure(state=tk.DISABLED)
 
     def _drain_log_queue(self) -> None:
         try:
@@ -636,35 +766,54 @@ class SubtitleGui(tk.Tk):
                     line = str(payload)
                     if not self._handle_progress_line(line):
                         self._append_log(line)
-                elif kind == "done":
-                    code = int(payload or 0)
+                elif kind == "item_status":
+                    assert isinstance(payload, tuple)
+                    index, status = payload
+                    self._set_item_status(int(index), str(status))
+                elif kind == "reset_progress":
+                    self._reset_progress()
+                elif kind == "queue_done":
                     self._set_running(False)
-                    if code == 0:
+                    if self.cancel_requested:
+                        self.status.set("Cancelled")
+                        self._append_log("\nQueue cancelled.\n")
+                    else:
                         self.status.set("Done")
                         self.progress.configure(value=100)
-                        self.progress_text.set("100% complete")
-                        self._append_log("\nFinished successfully.\n")
-                    else:
-                        self.status.set(f"Stopped with exit code {code}")
-                        self._append_log(f"\nStopped with exit code {code}.\n")
+                        self.progress_text.set("Queue complete")
+                        self._append_log("\nQueue finished.\n")
                     self.process = None
         except queue.Empty:
             pass
         self.after(100, self._drain_log_queue)
 
+    def _reset_progress(self) -> None:
+        self.duration_seconds = 0.0
+        self.last_progress_seconds = 0.0
+        self.progress_started_at = 0.0
+        self.progress.configure(value=0)
+        self.progress_text.set("Starting...")
+
     def _set_running(self, running: bool) -> None:
+        self.queue_running = running
         if running:
             self.status.set("Running")
-            self.duration_seconds = 0.0
-            self.last_progress_seconds = 0.0
-            self.progress_started_at = 0.0
-            self.progress.configure(value=0)
-            self.progress_text.set("Starting...")
+            self._reset_progress()
             self.start_button.configure(state=tk.DISABLED)
             self.cancel_button.configure(state=tk.NORMAL)
+            self.add_files_button.configure(state=tk.DISABLED)
+            self.remove_button.configure(state=tk.DISABLED)
+            self.clear_queue_button.configure(state=tk.DISABLED)
+            self.output_dir_entry.configure(state=tk.DISABLED)
+            self.output_dir_browse_button.configure(state=tk.DISABLED)
         else:
             self.start_button.configure(state=tk.NORMAL)
             self.cancel_button.configure(state=tk.DISABLED)
+            self.add_files_button.configure(state=tk.NORMAL)
+            self.remove_button.configure(state=tk.NORMAL)
+            self.clear_queue_button.configure(state=tk.NORMAL)
+            self.output_dir_entry.configure(state=tk.NORMAL)
+            self.output_dir_browse_button.configure(state=tk.NORMAL)
 
     def _append_log(self, text: str) -> None:
         self.log_text.configure(state=tk.NORMAL)
@@ -678,8 +827,13 @@ class SubtitleGui(tk.Tk):
         self.log_text.configure(state=tk.DISABLED)
 
     def _open_output_dir(self) -> None:
-        output_file = ensure_srt_suffix(self.output_file.get().strip())
-        path = split_output_target(output_file)[2].parent if output_file else project_root() / "subtitles"
+        override = self.output_dir.get().strip()
+        if override:
+            path = Path(override)
+        elif self.queue_items:
+            path = default_output_file_for(self.queue_items[0]).parent
+        else:
+            path = project_root() / "subtitles"
         path.mkdir(parents=True, exist_ok=True)
         try:
             os.startfile(path)
