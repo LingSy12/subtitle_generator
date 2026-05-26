@@ -46,6 +46,14 @@ For smaller NVIDIA GPUs, tick **Limit GPU VRAM** before starting.
 If the generated subtitles drift or do not line up with the video, tick
 **Accurate timing** and regenerate.
 
+You can also paste a YouTube (or other supported site) URL: click **Add URL**,
+paste the link, and the GUI downloads the audio with
+[`yt-dlp`](https://github.com/yt-dlp/yt-dlp) before transcribing. The audio
+file is saved under a `downloads/` folder next to your output (or under
+`D:\youtubesubtitle\downloads\` if no output folder is set). Tick
+**Delete URL audio after** if you only want the subtitle file kept. Public and
+unlisted videos work without sign-in; private videos are not supported.
+
 The GUI runs the local Python transcriber on this computer. It shows a progress
 bar with estimated time left during transcription and writes the selected output
 formats next to the chosen base path. The first model use may need internet to

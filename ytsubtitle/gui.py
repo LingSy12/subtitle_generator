@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -11,7 +12,7 @@ from pathlib import Path
 from typing import Iterable
 
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 
 VIDEO_FILE_TYPES = [
@@ -303,6 +304,7 @@ class SubtitleGui(tk.Tk):
             for value, _label in OUTPUT_FORMAT_OPTIONS
         }
         self.extract_audio = tk.BooleanVar(value=False)
+        self.delete_downloads_after = tk.BooleanVar(value=False)
         self.status = tk.StringVar(value="Ready")
         self.progress_text = tk.StringVar(value="Ready")
         self.duration_seconds = 0.0
@@ -373,14 +375,18 @@ class SubtitleGui(tk.Tk):
             queue_buttons, text="Add Files", command=self._add_files
         )
         self.add_files_button.grid(row=0, column=0, sticky="ew")
+        self.add_url_button = ttk.Button(
+            queue_buttons, text="Add URL", command=self._add_url
+        )
+        self.add_url_button.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         self.remove_button = ttk.Button(
             queue_buttons, text="Remove", command=self._remove_selected
         )
-        self.remove_button.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        self.remove_button.grid(row=2, column=0, sticky="ew", pady=(4, 0))
         self.clear_queue_button = ttk.Button(
             queue_buttons, text="Clear", command=self._clear_queue
         )
-        self.clear_queue_button.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self.clear_queue_button.grid(row=3, column=0, sticky="ew", pady=(4, 0))
 
         row += 1
         ttk.Label(controls, text="Output folder").grid(
@@ -432,6 +438,11 @@ class SubtitleGui(tk.Tk):
         ttk.Checkbutton(
             controls, text="Word timestamps", variable=self.word_timestamps
         ).grid(row=row, column=3, sticky="w", padx=(8, 8), pady=(10, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Delete URL audio after",
+            variable=self.delete_downloads_after,
+        ).grid(row=row, column=4, sticky="w", padx=(8, 0), pady=(10, 0))
 
         row += 1
         ttk.Label(controls, text="Task").grid(row=row, column=0, sticky="w", pady=(10, 0))
@@ -562,6 +573,26 @@ class SubtitleGui(tk.Tk):
             self.queue_items.append(path)
         self._rebuild_queue_tree()
 
+    def _add_url(self) -> None:
+        if self.queue_running:
+            return
+        url = simpledialog.askstring(
+            "Add URL",
+            "Paste a YouTube (or other video) URL:",
+            parent=self,
+        )
+        if not url:
+            return
+        url = url.strip()
+        if not is_url(url):
+            messagebox.showerror(
+                "Invalid URL",
+                "URL must start with http:// or https://",
+            )
+            return
+        self.queue_items.append(url)
+        self._rebuild_queue_tree()
+
     def _remove_selected(self) -> None:
         if self.queue_running:
             return
@@ -600,9 +631,12 @@ class SubtitleGui(tk.Tk):
 
     def _rebuild_queue_tree(self) -> None:
         self.queue_tree.delete(*self.queue_tree.get_children())
-        for index, path in enumerate(self.queue_items):
+        for index, item in enumerate(self.queue_items):
             self.queue_tree.insert(
-                "", "end", iid=str(index), values=(Path(path).name, "Pending")
+                "",
+                "end",
+                iid=str(index),
+                values=(display_name_for_queue_item(item), "Pending"),
             )
 
     def _set_item_status(self, index: int, status: str) -> None:
@@ -610,7 +644,7 @@ class SubtitleGui(tk.Tk):
         if not self.queue_tree.exists(iid):
             return
         if 0 <= index < len(self.queue_items):
-            name = Path(self.queue_items[index]).name
+            name = display_name_for_queue_item(self.queue_items[index])
             self.queue_tree.item(iid, values=(name, status))
 
     def _start(self) -> None:
@@ -619,7 +653,9 @@ class SubtitleGui(tk.Tk):
         if not self.queue_items:
             messagebox.showerror("Empty queue", "Add at least one file to the queue.")
             return
-        missing = [p for p in self.queue_items if not Path(p).exists()]
+        missing = [
+            p for p in self.queue_items if not is_url(p) and not Path(p).exists()
+        ]
         if missing:
             messagebox.showerror(
                 "File not found", "These files do not exist:\n" + "\n".join(missing)
@@ -661,6 +697,7 @@ class SubtitleGui(tk.Tk):
             "media_chunk_overlap_seconds": 3,
             "no_cpu_fallback": self.gpu_only.get() and device != "cpu",
             "task": parse_task_value(self.task.get()),
+            "delete_downloads_after": self.delete_downloads_after.get(),
         }
 
         self._clear_log()
@@ -674,6 +711,91 @@ class SubtitleGui(tk.Tk):
         )
         thread.start()
 
+    def _download_url(self, url: str, dest_dir: Path) -> Path | None:
+        try:
+            from yt_dlp import YoutubeDL
+            from yt_dlp.utils import DownloadError
+        except ImportError:
+            self.log_queue.put((
+                "line",
+                "yt-dlp is not installed. Run:\n"
+                "    .venv\\Scripts\\pip install yt-dlp\n",
+            ))
+            return None
+
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        log_q = self.log_queue
+        cancel_flag = lambda: self.cancel_requested  # noqa: E731
+        ansi_re = re.compile(r"\x1b\[[0-9;]*[mGKHF]")
+
+        def clean(text: str) -> str:
+            return ansi_re.sub("", text or "")
+
+        class _GuiLogger:
+            def debug(self, msg: str) -> None: return
+            def info(self, msg: str) -> None:
+                if msg:
+                    log_q.put(("line", clean(msg) + "\n"))
+            def warning(self, msg: str) -> None:
+                log_q.put(("line", f"[yt-dlp] {clean(msg)}\n"))
+            def error(self, msg: str) -> None:
+                log_q.put(("line", f"[yt-dlp error] {clean(msg)}\n"))
+
+        last_bucket: list[int] = [-1]
+
+        def _hook(d: dict) -> None:
+            if cancel_flag():
+                raise DownloadCancelled()
+            if d.get("status") == "downloading":
+                downloaded = d.get("downloaded_bytes") or 0
+                total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+                if total <= 0:
+                    return
+                bucket = int(downloaded * 100 / total / 5)
+                if bucket == last_bucket[0]:
+                    return
+                last_bucket[0] = bucket
+                pct = bucket * 5
+                speed = clean(d.get("_speed_str") or "").strip()
+                eta = clean(d.get("_eta_str") or "").strip()
+                log_q.put((
+                    "line",
+                    f"Downloading audio: {pct:3d}%  speed {speed}  ETA {eta}\n",
+                ))
+            elif d.get("status") == "finished":
+                log_q.put(("line", "Download finished, finalising file...\n"))
+
+        opts = {
+            "format": "bestaudio",
+            "outtmpl": str(dest_dir / "%(title)s-%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": False,
+            "no_color": True,
+            "logger": _GuiLogger(),
+            "progress_hooks": [_hook],
+        }
+
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filepath = ydl.prepare_filename(info)
+        except DownloadCancelled:
+            log_q.put(("line", "Download cancelled.\n"))
+            return None
+        except DownloadError as exc:
+            log_q.put(("line", f"Download failed: {exc}\n"))
+            return None
+        except Exception as exc:
+            log_q.put(("line", f"Download error: {exc}\n"))
+            return None
+
+        downloaded = Path(filepath)
+        if not downloaded.exists():
+            log_q.put(("line", f"Expected file not found: {downloaded}\n"))
+            return None
+        return downloaded
+
     def _run_queue(
         self,
         paths: list[str],
@@ -682,10 +804,35 @@ class SubtitleGui(tk.Tk):
     ) -> None:
         python_exe = find_python_executable()
         total = len(paths)
-        for index, input_path in enumerate(paths):
+        delete_downloads_after = config.pop("delete_downloads_after", False)
+        if output_dir_override:
+            download_dir = Path(output_dir_override) / "downloads"
+        else:
+            download_dir = project_root() / "downloads"
+
+        for index, input_entry in enumerate(paths):
             if self.cancel_requested:
                 self.log_queue.put(("item_status", (index, "Cancelled")))
                 continue
+
+            downloaded_path: Path | None = None
+            if is_url(input_entry):
+                self.log_queue.put(("item_status", (index, "Downloading")))
+                self.log_queue.put(("reset_progress", None))
+                self.log_queue.put((
+                    "line",
+                    f"\n=== [{index + 1}/{total}] Downloading {input_entry} ===\n",
+                ))
+                downloaded = self._download_url(input_entry, download_dir)
+                if downloaded is None:
+                    status = "Cancelled" if self.cancel_requested else "Download failed"
+                    self.log_queue.put(("item_status", (index, status)))
+                    continue
+                downloaded_path = downloaded
+                input_path = str(downloaded)
+                self.log_queue.put(("line", f"Saved to: {input_path}\n"))
+            else:
+                input_path = input_entry
 
             if output_dir_override:
                 output_file = str(
@@ -744,6 +891,21 @@ class SubtitleGui(tk.Tk):
             self.log_queue.put(
                 ("line", f"\n--- {Path(input_path).name}: {status} ---\n")
             )
+
+            if (
+                return_code == 0
+                and delete_downloads_after
+                and downloaded_path is not None
+            ):
+                try:
+                    downloaded_path.unlink()
+                    self.log_queue.put(
+                        ("line", f"Deleted downloaded audio: {downloaded_path}\n")
+                    )
+                except OSError as exc:
+                    self.log_queue.put(
+                        ("line", f"Could not delete {downloaded_path}: {exc}\n")
+                    )
 
         self.log_queue.put(("queue_done", None))
 
@@ -999,6 +1161,21 @@ def parse_chunk_option(value: str) -> int | None:
     except ValueError:
         return None
     return seconds if seconds > 0 else None
+
+
+def is_url(text: str) -> bool:
+    lowered = text.strip().lower()
+    return lowered.startswith("http://") or lowered.startswith("https://")
+
+
+def display_name_for_queue_item(item: str) -> str:
+    if is_url(item):
+        return item
+    return Path(item).name
+
+
+class DownloadCancelled(Exception):
+    """Raised inside a yt-dlp progress hook to abort a download."""
 
 
 def find_python_executable() -> str:
