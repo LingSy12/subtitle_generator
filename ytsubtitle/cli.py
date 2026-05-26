@@ -39,6 +39,12 @@ DEFAULT_MEDIA_CHUNK_OVERLAP_SECONDS = 2
 # only filters when no_speech_prob > 0.6 AND avg_logprob < -1.0 — so confident
 # hallucinations in silent regions slip through. We filter on no_speech_prob alone.
 HALLUCINATION_NO_SPEECH_THRESHOLD = 0.6
+# Beam search over a silent/music region can lock onto a high-frequency training
+# artifact (a subtitle-credit watermark) and emit it across many segments in a
+# row. faster-whisper's repeat suppression doesn't span segments, so we drop any
+# run of this many or more consecutive segments with identical text. Real speech
+# rarely repeats one phrase 5+ times back-to-back.
+HALLUCINATION_REPEAT_LIMIT = 5
 
 
 @dataclass(frozen=True)
@@ -226,6 +232,7 @@ def run_transcription_attempt(
         allow_chunk_cpu_fallback=not args.no_cpu_fallback,
         start_seconds=args.start_seconds,
     )
+    segments = drop_consecutive_repeats(segments, HALLUCINATION_REPEAT_LIMIT)
 
     print(f"Using device: {attempt.device} ({attempt.compute_type})", flush=True)
     if attempt.low_vram:
@@ -334,6 +341,39 @@ def run_transcription_attempt(
 
     written_paths = finalize_output_files(temp_paths, temp_output_base, output_base)
     return written_paths, cue_count, segment_count
+
+
+def drop_consecutive_repeats(segments, limit: int):
+    """Yield segments, dropping runs of ``limit``+ consecutive identical texts.
+
+    Beam search in silent/music regions can lock onto a training-data artifact
+    (a subtitle-credit watermark) and repeat it across many segments. That
+    cross-segment loop is a hallucination, not speech, so the whole run is
+    dropped. Shorter repeats — a speaker actually saying a word twice — pass
+    through untouched.
+    """
+    run: list = []
+    for segment in segments:
+        if run and segment.text.strip() == run[0].text.strip():
+            run.append(segment)
+            continue
+        yield from _emit_repeat_run(run, limit)
+        run = [segment]
+    yield from _emit_repeat_run(run, limit)
+
+
+def _emit_repeat_run(run: list, limit: int):
+    if not run:
+        return
+    if len(run) >= limit:
+        print(
+            f"[hallucination] dropped {len(run)}x repeated "
+            f"'{run[0].text.strip()}' "
+            f"({format_duration(run[0].start)}-{format_duration(run[-1].end)})",
+            flush=True,
+        )
+        return
+    yield from run
 
 
 def build_parser() -> argparse.ArgumentParser:
