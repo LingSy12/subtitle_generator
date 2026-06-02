@@ -14,6 +14,11 @@ It creates:
 The transcriber uses [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
 locally, so multi-hour videos do not need to be uploaded to another service.
 
+## 📸 Screenshots
+
+<!-- Replace screenshots/screenshot.png with a real GUI capture (keep the filename), or add more images below. -->
+![Chinese Subtitle Generator GUI](screenshots/screenshot.png)
+
 ## 1. Install
 
 Open PowerShell in this folder:
