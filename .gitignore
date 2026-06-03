@@ -14,3 +14,4 @@ vendor/
 
 # Local Claude Code settings
 .claude/
+CLAUDE.md
